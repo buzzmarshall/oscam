@@ -100,6 +100,7 @@ struct irdeto_data
 {
 	int32_t acs57; // A flag for the ACS57 ITA DVB-T
 	uint16_t acs;
+	int32_t acsfox; // A flag for FOX DVB-T
 	char country_code[3]; // irdeto country code.
 };
 
@@ -255,7 +256,6 @@ static int32_t irdeto_do_cmd(struct s_reader *reader, uint8_t *buf, uint16_t goo
 	{
 		return (rc); // result may be 0 (success) or negative
 	}
-
 	if(*p_cta_lr < 2)
 	{
 		return (0x7F7F); // this should never happen
@@ -300,9 +300,15 @@ static int32_t irdeto_card_init_provider(struct s_reader *reader)
 		{
 			sc_GetProvider[3] = i;
 			reader_chk_cmd(sc_GetProvider, 0);
+			rdr_log(reader, "cta_lr=0x%04x", cta_lr);
+            if((csystem_data->acsfox == 1) && (cta_lr < 26))
+			{
+				reader->nprov = i;
+				break;
+			}
 		}
 
-		if(((cta_lr == 26) && ((!(i & 1)) || (cta_res[0] != 0xf))) || (csystem_data->acs57 == 1))
+		if(((cta_lr == 26) && ((!(i & 1)) || (cta_res[0] != 0xf))) || (csystem_data->acs57 == 1) || (csystem_data->acsfox == 1))
 		{
 			reader->prid[i][4] = p++;
 
@@ -394,6 +400,7 @@ static int32_t irdeto_card_init(struct s_reader *reader, ATR *newatr)
 	}
 	struct irdeto_data *csystem_data = reader->csystem_data;
 	csystem_data->acs57 = acs57;
+	csystem_data->acsfox = 0;
 
 	rdr_log(reader, "detect irdeto card");
 	if((array_has_nonzero_byte(reader->rsa_mod, 64) > 0) && (!reader->force_irdeto || csystem_data->acs57)) // we use rsa from config as camkey
@@ -457,6 +464,12 @@ static int32_t irdeto_card_init(struct s_reader *reader, ATR *newatr)
 	rdr_log(reader, "caid: %04X, acs: %x.%02x, country code: %c%c%c",
 		reader->caid, cta_res[0 + acspadd], cta_res[1 + acspadd], cta_res[13 + acspadd], cta_res[14 + acspadd], cta_res[15 + acspadd]);
 
+    if ((reader->caid == 0x0638) || (reader->caid == 0x0642) || (reader->caid == 0x0652))
+	{
+		csystem_data->acsfox = 1;
+		acspadd = 8;
+	}
+
 	/*
 	 * Ascii/Hex-Serial
 	 */
@@ -485,6 +498,10 @@ static int32_t irdeto_card_init(struct s_reader *reader, ATR *newatr)
 		reader_chk_cmd(sc_GetHEXSerial, 18);
 	}
 	reader->nprov = cta_res[10 + acspadd];
+	if(reader->nprov > CS_MAXPROV)
+	{
+		reader->nprov = CS_MAXPROV;
+	}
 	memcpy(reader->hexserial, cta_res + 12 + acspadd, 4);
 
 	rdr_log_sensitive(reader, "providers: %d, ascii serial: {%s}, hex serial: {%02X%02X%02X}, hex base: {%02X}",
@@ -507,6 +524,14 @@ static int32_t irdeto_card_init(struct s_reader *reader, ATR *newatr)
 		sc_Acs57_Cmd[2] = 0x03;
 		reader_chk_cmd(sc_Acs57_Cmd, acslength + 2);
 		sc_Acs57_Cmd[2] = 0x00;
+	}
+	else if(csystem_data->acsfox == 1)
+	{	/*   cam error...
+		for(sc_GetCardFile[2] = 2; sc_GetCardFile[2] < 4; sc_GetCardFile[2]++)
+		{
+			reader_chk_cmd(sc_GetCardFile, 0);
+		}
+		*/
 	}
 	else
 	{
@@ -717,10 +742,13 @@ int32_t irdeto_do_ecm(struct s_reader *reader, const ECM_REQUEST *er, struct s_e
 	}
 	else
 	{
+		if (csystem_data->acsfox)
+		{
+			acspadd = 8;
+		}
 		memcpy(cta_cmd, sc_EcmCmd, sizeof(sc_EcmCmd));
 		cta_cmd[4] = (er->ecm[2]) - 3;
 		memcpy(cta_cmd + sizeof(sc_EcmCmd), &er->ecm[6], cta_cmd[4]);
-
 		int32_t try = 1;
 		int32_t ret;
 		do
@@ -816,7 +844,16 @@ int32_t irdeto_do_ecm(struct s_reader *reader, const ECM_REQUEST *er, struct s_e
 
 	ReverseSessionKeyCrypt(reader->boxkey, cta_res + 6 + acspadd);
 	ReverseSessionKeyCrypt(reader->boxkey, cta_res + 14 + acspadd);
-	memcpy(ea->cw, cta_res + 6 + acspadd, 16);
+	uint8_t cw[16];
+	memcpy(cw, cta_res + 6 + acspadd, 16);
+	if(csystem_data->acsfox == 1)
+	{
+		cw[3] = cw[0]+cw[1]+cw[2];
+		cw[7] = cw[4]+cw[5]+cw[6];
+		cw[11] = cw[8]+cw[9]+cw[10];
+		cw[15] = cw[12]+cw[13]+cw[14];
+	}
+	memcpy(ea->cw, cw, 16);
 	return OK;
 }
 
@@ -939,21 +976,38 @@ static int32_t irdeto_get_emm_filter(struct s_reader *rdr, struct s_csystem_emm_
 		*filter_count = 0;
 
 		unsigned int idx = 0;
+		struct irdeto_data *csystem_data = rdr->csystem_data;
 
 		filters[idx].type = EMM_GLOBAL;
 		filters[idx].enabled = 1;
 		filters[idx].filter[0] = 0x82;
 		filters[idx].mask[0] = 0xFF;
-		filters[idx].filter[1] = 0xF8;
-		filters[idx].mask[1] = 0x07;
+		if(csystem_data->acsfox == 0)
+		{
+			filters[idx].filter[1] = 0xF8;
+			filters[idx].mask[1] = 0x07;
+		}
+		else
+		{
+			filters[idx].filter[1] = 0x02;
+			filters[idx].mask[1] = 0x03;
+		}
 		idx++;
 
 		filters[idx].type = EMM_UNIQUE;
 		filters[idx].enabled = 1;
 		filters[idx].filter[0] = 0x82;
 		filters[idx].mask[0] = 0xFF;
-		filters[idx].filter[1] = 0xFB;
-		filters[idx].mask[1] = 0x07;
+		if(csystem_data->acsfox == 0)
+		{
+			filters[idx].filter[1] = 0xFB;
+			filters[idx].mask[1] = 0x07;
+		}
+		else
+		{
+			filters[idx].filter[1] = 0x03;
+			filters[idx].mask[1] = 0x03;
+		}
 		memcpy(&filters[idx].filter[2], rdr->hexserial, 3);
 		memset(&filters[idx].mask[2], 0xFF, 3);
 		idx++;
@@ -985,8 +1039,18 @@ static int32_t irdeto_get_emm_filter(struct s_reader *rdr, struct s_csystem_emm_
 			filters[idx].enabled = 1;
 			filters[idx].filter[0] = 0x82;
 			filters[idx].mask[0] = 0xFF;
-			filters[idx].filter[1] = 0xFB;
-			filters[idx].mask[1] = 0x07;
+			if(csystem_data->acsfox == 0)
+			{
+				filters[idx].filter[1] = 0xFB;
+				filters[idx].mask[1] = 0x07;
+			}
+			else
+			{
+				filters[idx].filter[1] = 0x03;
+				filters[idx].mask[1] = 0x03;
+				memcpy(&filters[0].filter[2], &rdr->prid[i][1], 3);
+				memset(&filters[0].mask[2], 0xFF, 3);
+			}
 			memcpy(&filters[idx].filter[2], &rdr->prid[i][1], 3);
 			memset(&filters[idx].mask[2], 0xFF, 3);
 			idx++;
